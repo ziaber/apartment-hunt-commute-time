@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Dict, List
 from config import Config
 from cache import CommuteCache
-from maps_api import MapsAPIClient
+from routes_api import RoutesAPIClient
 
 
 def format_duration(seconds: int) -> str:
@@ -23,11 +23,66 @@ def format_duration(seconds: int) -> str:
     return f"{minutes}min"
 
 
+def format_transit_step(step: Dict) -> str:
+    """
+    Format a transit step for compact display with stop names.
+
+    Args:
+        step: Transit step dictionary
+
+    Returns:
+        Formatted step string
+    """
+    if step['type'] == 'WALK':
+        duration = format_duration(step['duration_seconds'])
+        return f"Walk {duration}"
+    elif step['type'] == 'TRANSIT':
+        duration = format_duration(step['duration_seconds'])
+        vehicle = step.get('vehicle_type', 'transit').title()
+        line = step.get('transit_line', '')
+        dep_stop = step.get('departure_stop', '')
+        arr_stop = step.get('arrival_stop', '')
+
+        # Build transit segment description
+        parts = []
+        if line:
+            parts.append(f"{vehicle} {line}")
+        else:
+            parts.append(vehicle)
+
+        parts.append(f"({duration})")
+
+        # Add stop names if available
+        if dep_stop and arr_stop:
+            parts.append(f"[{dep_stop} → {arr_stop}]")
+
+        return " ".join(parts)
+    else:
+        return f"{step['type']} {format_duration(step['duration_seconds'])}"
+
+
+def format_transit_breakdown(steps: List[Dict]) -> str:
+    """
+    Format the transit step breakdown compactly.
+
+    Args:
+        steps: List of transit step dictionaries
+
+    Returns:
+        Formatted breakdown string
+    """
+    if not steps:
+        return ""
+
+    formatted_steps = [format_transit_step(step) for step in steps]
+    return " → ".join(formatted_steps)
+
+
 def calculate_commutes(
     apartment_address: str,
     config: Config,
     cache: CommuteCache,
-    maps_client: MapsAPIClient,
+    routes_client: RoutesAPIClient,
     force_refresh: bool = False
 ) -> Dict:
     """
@@ -37,28 +92,34 @@ def calculate_commutes(
         apartment_address: Address or POI of the potential apartment
         config: Configuration object
         cache: Cache object
-        maps_client: Google Maps API client
+        routes_client: Routes API client
         force_refresh: If True, ignore cache and fetch fresh data
 
     Returns:
         Dictionary with commute results for both people
     """
-    query_date = datetime.now().strftime('%Y-%m-%d')
+    # Get target date based on day_of_week setting
+    target_date = config.get_target_date()
+    query_date_str = target_date.strftime('%Y-%m-%d')
+    day_of_week = config.day_of_week
+
     arrival_times = config.get_arrival_times()
 
     results = {
         'apartment': apartment_address,
-        'query_date': query_date,
+        'query_date': query_date_str,
+        'day_of_week': day_of_week,
         'my_commutes': [],
         'girlfriend_commutes': []
     }
 
     print(f"\nCalculating commutes from: {apartment_address}")
-    print("=" * 70)
+    print(f"Target date: {query_date_str} ({day_of_week})")
+    print("=" * 90)
 
     # Calculate my commutes (transit)
     print(f"\n🚊 Your commute to {config.my_job_location} (via {config.my_travel_mode}):")
-    print("-" * 70)
+    print("-" * 90)
 
     for arrival_time in arrival_times:
         # Check cache first
@@ -69,25 +130,42 @@ def calculate_commutes(
                 config.my_job_location,
                 config.my_travel_mode,
                 arrival_time,
-                query_date
+                day_of_week,
+                query_date_str
             )
 
         if cached:
-            print(f"  {arrival_time} - {format_duration(cached['duration_seconds']):>8} "
-                  f"({cached['distance_meters'] / 1000:.1f} km) [cached]")
+            duration_text = format_duration(cached['duration_seconds'])
+            distance_km = cached['distance_meters'] / 1000
+
+            print(f"  {arrival_time} - {duration_text:>8} ({distance_km:.1f} km) [cached]")
+
+            # Show transit breakdown if available
+            if cached.get('transit_steps'):
+                breakdown = format_transit_breakdown(cached['transit_steps'])
+                print(f"    └─ {breakdown}")
+
             results['my_commutes'].append({
                 'arrival_time': arrival_time,
                 'duration_seconds': cached['duration_seconds'],
                 'distance_meters': cached['distance_meters'],
+                'transit_steps': cached.get('transit_steps'),
                 'cached': True
             })
         else:
             # Fetch from API
-            commute_data = maps_client.get_commute_time(
+            # Create arrival datetime
+            hour, minute = map(int, arrival_time.split(':'))
+            arrival_datetime = datetime.combine(
+                target_date,
+                datetime.min.time().replace(hour=hour, minute=minute)
+            )
+
+            commute_data = routes_client.get_commute_time(
                 apartment_address,
                 config.my_job_location,
-                arrival_time,
-                config.my_travel_mode
+                arrival_datetime,
+                'TRANSIT'
             )
 
             if commute_data:
@@ -97,27 +175,36 @@ def calculate_commutes(
                     config.my_job_location,
                     config.my_travel_mode,
                     arrival_time,
-                    query_date,
+                    day_of_week,
+                    query_date_str,
                     commute_data['duration_seconds'],
-                    commute_data.get('duration_in_traffic_seconds'),
-                    commute_data['distance_meters']
+                    commute_data['distance_meters'],
+                    transit_steps=commute_data.get('transit_steps')
                 )
 
-                print(f"  {arrival_time} - {format_duration(commute_data['duration_seconds']):>8} "
-                      f"({commute_data['distance_meters'] / 1000:.1f} km)")
+                duration_text = format_duration(commute_data['duration_seconds'])
+                distance_km = commute_data['distance_meters'] / 1000
+
+                print(f"  {arrival_time} - {duration_text:>8} ({distance_km:.1f} km)")
+
+                # Show transit breakdown if available
+                if commute_data.get('transit_steps'):
+                    breakdown = format_transit_breakdown(commute_data['transit_steps'])
+                    print(f"    └─ {breakdown}")
 
                 results['my_commutes'].append({
                     'arrival_time': arrival_time,
                     'duration_seconds': commute_data['duration_seconds'],
                     'distance_meters': commute_data['distance_meters'],
+                    'transit_steps': commute_data.get('transit_steps'),
                     'cached': False
                 })
             else:
                 print(f"  {arrival_time} - Error fetching data")
 
-    # Calculate girlfriend's commutes (driving)
+    # Calculate girlfriend's commutes (driving with traffic range)
     print(f"\n🚗 Girlfriend's commute to {config.girlfriend_job_location} (via {config.girlfriend_travel_mode}):")
-    print("-" * 70)
+    print("-" * 90)
 
     for arrival_time in arrival_times:
         # Check cache first
@@ -128,59 +215,70 @@ def calculate_commutes(
                 config.girlfriend_job_location,
                 config.girlfriend_travel_mode,
                 arrival_time,
-                query_date
+                day_of_week,
+                query_date_str
             )
 
-        if cached:
-            traffic_info = ""
-            if cached['duration_in_traffic_seconds']:
-                traffic_duration = format_duration(cached['duration_in_traffic_seconds'])
-                traffic_info = f" (with traffic: {traffic_duration})"
+        if cached and cached.get('min_duration_seconds') and cached.get('max_duration_seconds'):
+            # Display time range
+            min_time = format_duration(cached['min_duration_seconds'])
+            max_time = format_duration(cached['max_duration_seconds'])
+            typical_time = format_duration(cached['typical_duration_seconds'] or cached['duration_seconds'])
+            distance_km = cached['distance_meters'] / 1000
 
-            print(f"  {arrival_time} - {format_duration(cached['duration_seconds']):>8} "
-                  f"({cached['distance_meters'] / 1000:.1f} km){traffic_info} [cached]")
+            print(f"  {arrival_time} - {min_time}-{max_time} (typically {typical_time}) ({distance_km:.1f} km) [cached]")
 
             results['girlfriend_commutes'].append({
                 'arrival_time': arrival_time,
-                'duration_seconds': cached['duration_seconds'],
-                'duration_in_traffic_seconds': cached['duration_in_traffic_seconds'],
+                'min_duration_seconds': cached['min_duration_seconds'],
+                'typical_duration_seconds': cached['typical_duration_seconds'],
+                'max_duration_seconds': cached['max_duration_seconds'],
                 'distance_meters': cached['distance_meters'],
                 'cached': True
             })
         else:
-            # Fetch from API
-            commute_data = maps_client.get_commute_time(
-                apartment_address,
-                config.girlfriend_job_location,
-                arrival_time,
-                config.girlfriend_travel_mode
+            # Fetch from API with 3 traffic models
+            # Create arrival datetime
+            hour, minute = map(int, arrival_time.split(':'))
+            arrival_datetime = datetime.combine(
+                target_date,
+                datetime.min.time().replace(hour=hour, minute=minute)
             )
 
-            if commute_data:
+            commute_data = routes_client.get_commute_time_with_traffic_range(
+                apartment_address,
+                config.girlfriend_job_location,
+                arrival_datetime
+            )
+
+            if commute_data and commute_data.get('min_duration_seconds'):
                 # Save to cache
                 cache.save_result(
                     apartment_address,
                     config.girlfriend_job_location,
                     config.girlfriend_travel_mode,
                     arrival_time,
-                    query_date,
-                    commute_data['duration_seconds'],
-                    commute_data.get('duration_in_traffic_seconds'),
-                    commute_data['distance_meters']
+                    day_of_week,
+                    query_date_str,
+                    commute_data['typical_duration_seconds'],
+                    commute_data['distance_meters'],
+                    min_duration_seconds=commute_data['min_duration_seconds'],
+                    typical_duration_seconds=commute_data['typical_duration_seconds'],
+                    max_duration_seconds=commute_data['max_duration_seconds']
                 )
 
-                traffic_info = ""
-                if commute_data.get('duration_in_traffic_seconds'):
-                    traffic_duration = format_duration(commute_data['duration_in_traffic_seconds'])
-                    traffic_info = f" (with traffic: {traffic_duration})"
+                min_time = format_duration(commute_data['min_duration_seconds'])
+                max_time = format_duration(commute_data['max_duration_seconds'])
+                typical_time = format_duration(commute_data['typical_duration_seconds'])
+                distance_km = commute_data['distance_meters'] / 1000
 
-                print(f"  {arrival_time} - {format_duration(commute_data['duration_seconds']):>8} "
-                      f"({commute_data['distance_meters'] / 1000:.1f} km){traffic_info}")
+                print(f"  {arrival_time} - {min_time}-{max_time} (typically {typical_time}) ({distance_km:.1f} km)")
 
                 results['girlfriend_commutes'].append({
                     'arrival_time': arrival_time,
-                    'duration_seconds': commute_data['duration_seconds'],
-                    'duration_in_traffic_seconds': commute_data.get('duration_in_traffic_seconds'),
+                    'min_duration_seconds': commute_data['min_duration_seconds'],
+                    'typical_duration_seconds': commute_data['typical_duration_seconds'],
+                    'max_duration_seconds': commute_data['max_duration_seconds'],
                     'distance_meters': commute_data['distance_meters'],
                     'cached': False
                 })
@@ -188,9 +286,9 @@ def calculate_commutes(
                 print(f"  {arrival_time} - Error fetching data")
 
     # Print summary statistics
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 90)
     print("SUMMARY")
-    print("=" * 70)
+    print("=" * 90)
 
     if results['my_commutes']:
         my_durations = [c['duration_seconds'] for c in results['my_commutes']]
@@ -204,15 +302,16 @@ def calculate_commutes(
         print(f"  Worst:   {format_duration(my_max)}")
 
     if results['girlfriend_commutes']:
+        # Use typical duration for summary
         gf_durations = [
-            c.get('duration_in_traffic_seconds') or c['duration_seconds']
+            c.get('typical_duration_seconds', 0)
             for c in results['girlfriend_commutes']
         ]
         gf_avg = sum(gf_durations) / len(gf_durations)
         gf_min = min(gf_durations)
         gf_max = max(gf_durations)
 
-        print(f"\n🚗 Girlfriend's commute (with traffic):")
+        print(f"\n🚗 Girlfriend's commute (typical times with traffic):")
         print(f"  Average: {format_duration(int(gf_avg))}")
         print(f"  Best:    {format_duration(gf_min)}")
         print(f"  Worst:   {format_duration(gf_max)}")
@@ -238,9 +337,9 @@ def main():
         help='Force refresh data from API, ignoring cache'
     )
     parser.add_argument(
-        '--verify',
-        action='store_true',
-        help='Verify the address with Google Maps before calculating'
+        '--day',
+        choices=['weekday', 'weekend'],
+        help='Override DAY_OF_WEEK setting (weekday or weekend)'
     )
 
     args = parser.parse_args()
@@ -248,7 +347,7 @@ def main():
     # If no address provided, ask for it
     if not args.address:
         print("Apartment Commute Calculator")
-        print("=" * 70)
+        print("=" * 90)
         args.address = input("\nEnter apartment address or POI in Kraków: ").strip()
 
         if not args.address:
@@ -259,32 +358,22 @@ def main():
         # Load configuration
         config = Config()
 
+        # Override day_of_week if specified
+        if args.day:
+            config.day_of_week = args.day
+
         # Initialize cache
         cache = CommuteCache(config.db_path)
 
-        # Initialize Google Maps client
-        maps_client = MapsAPIClient(config.google_maps_api_key)
-
-        # Verify address if requested
-        if args.verify:
-            print(f"\nVerifying address: {args.address}")
-            formatted_address = maps_client.geocode_address(args.address)
-            if formatted_address:
-                print(f"Found: {formatted_address}")
-                confirm = input("Use this address? (y/n): ").strip().lower()
-                if confirm != 'y':
-                    print("Aborted")
-                    sys.exit(0)
-                args.address = formatted_address
-            else:
-                print("Could not find this address. Proceeding anyway...")
+        # Initialize Routes API client
+        routes_client = RoutesAPIClient(config.google_maps_api_key)
 
         # Calculate commutes
         results = calculate_commutes(
             args.address,
             config,
             cache,
-            maps_client,
+            routes_client,
             args.force_refresh
         )
 

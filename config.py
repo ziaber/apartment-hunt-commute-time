@@ -2,6 +2,7 @@
 Configuration module for the commute calculator.
 """
 import os
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import Optional
 
@@ -41,6 +42,51 @@ class Config:
 
         # Database path
         self.db_path = os.getenv('DB_PATH', 'commute_cache.db')
+
+        # Day of week for commute calculation
+        self.day_of_week = os.getenv('DAY_OF_WEEK', 'weekday').lower()
+        if self.day_of_week not in ['weekday', 'weekend']:
+            raise ValueError("DAY_OF_WEEK must be either 'weekday' or 'weekend'")
+
+    def get_target_date(self):
+        """
+        Calculate the target date for commute predictions based on day_of_week setting.
+
+        - 'weekday': Returns next Monday (or today if today is Monday)
+        - 'weekend': Returns next Saturday (or today if today is Saturday)
+
+        Returns:
+            datetime.date object representing the target date
+        """
+        today = datetime.now().date()
+        weekday = today.weekday()  # Monday=0, Sunday=6
+
+        if self.day_of_week == 'weekday':
+            # Target: Monday (weekday=0)
+            if weekday == 0:
+                # Today is Monday
+                return today
+            elif weekday < 0:
+                # Should never happen, but handle it
+                days_ahead = 0
+            else:
+                # Calculate days until next Monday
+                days_ahead = (7 - weekday) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+            return today + timedelta(days=days_ahead)
+        else:  # weekend
+            # Target: Saturday (weekday=5)
+            if weekday == 5:
+                # Today is Saturday
+                return today
+            elif weekday < 5:
+                # Days until this Saturday
+                days_ahead = 5 - weekday
+            else:
+                # Days until next Saturday (Sunday=6, so next Saturday is 6 days away)
+                days_ahead = 6
+            return today + timedelta(days=days_ahead)
 
     def get_arrival_times(self):
         """
